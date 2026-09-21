@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# icloudctl 运行时状态（不会出现在仓库里，以防有人在本目录测试）
+frozen.state
+*.log

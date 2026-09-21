@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# icloudctl — 开关 macOS 的 iCloud 同步
+#
+# 语义：on  = 打开 iCloud 同步（恢复正常上传 / 下载）
+#       off = 关闭 iCloud 同步（冻结守护进程，一直关着直到手动 on）
+#
+# 原理：SIGSTOP 冻结负责同步的守护进程，SIGCONT 解冻。
+#      不依赖网络层（Clash / pf），Clash 退出也照样有效。
+#
+# 关键事实（macOS 26 实测）：
+#   - pf + dummynet 限速在内核层已失效（searches 恒为 0），不要走那条路
+#   - 冻结的是内核级状态，与是否联网、代理是否运行无关
+#   - 上传和下载会同时停止，因为引擎本身被冻住了
+
+set -o pipefail
+
+# ---------------------------------------------------------------- 配置
+
+# 默认冻结目标：只包含「用户级」iCloud 同步进程
+# 刻意排除 fileproviderd（微信 / Photos 也在用，冻结会影响传文件）
+DEFAULT_TARGETS="bird cloudd nsurlsessiond itunescloudd"
+
+# 需要 fileproviderd 时用：icloudctl on --with-fileprovider
+EXTRA_TARGETS="fileproviderd"
+
+# root 拥有的系统级 cloudd --system 无法也不需要冻结（权限不足，且与个人同步无关）
+
+STATE_DIR="${ICLOUDCTL_STATE_DIR:-$HOME/.local/state/icloudctl}"
+STATE_FILE="$STATE_DIR/frozen.state"
+LOG_FILE="$STATE_DIR/icloudctl.log"
+
+# 自动恢复保护（秒）。0 = 关闭（默认）。
+# 默认关闭：一旦 off 就保持关闭，只有手动 icloudctl on 才恢复。
+# 需要保险丝时显式开启：ICLOUDCTL_AUTO_RESUME_SECS=1800 icloudctl off
+AUTO_RESUME_SECS="${ICLOUDCTL_AUTO_RESUME_SECS:-0}"
+
+# ---------------------------------------------------------------- 输出
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null; }
+
+# ---------------------------------------------------------------- 核心
+
+# 列出当前实际在跑的、我们有权冻结的目标进程
+running_targets() {
+    local t
+    for t in $1; do
+        # 只输出属于当前用户且存在的进程名
+        if pgrep -u "$(id -u)" -x "$t" >/dev/null 2>&1; then
+            echo "$t"
+        fi
+    done
+}
+
+# 统计某进程名有多少个实例处于 T (stopped) 状态，且属于当前用户
+stopped_count() {
+    local name="$1" n=0 pid
+    for pid in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+        case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
+            T*) n=$((n + 1)) ;;
+        esac
+    done
+    echo "$n"
+}
+
+# icloudctl off —— 关闭 iCloud 同步（冻结守护进程）
+cmd_off() {
+    local with_fp=0
+    [ "$1" = "--with-fileprovider" ] && with_fp=1
+
+    local targets="$DEFAULT_TARGETS"
+    [ "$with_fp" -eq 1 ] && targets="$targets $EXTRA_TARGETS"
+
+    if [ -f "$STATE_FILE" ]; then
+        echo -e "${YELLOW}[i] iCloud 同步已经是关闭状态，无需重复操作${NC}"
+        echo -e "    查看详情: ${CYAN}icloudctl status${NC}"
+        return 0
+    fi
+
+    local frozen=() failed=()
+    local t
+    for t in $targets; do
+        if pgrep -u "$(id -u)" -x "$t" >/dev/null 2>&1; then
+            if killall -STOP "$t" 2>/dev/null; then
+                frozen+=("$t")
+            else
+                failed+=("$t")
+            fi
+        fi
+    done
+
+    if [ "${#frozen[@]}" -eq 0 ]; then
+        echo -e "${RED}[✗] 没有冻结任何进程${NC}"
+        [ "${#failed[@]}" -gt 0 ] && echo -e "    失败: ${failed[*]}"
+        return 1
+    fi
+
+    {
+        printf '%s\n' "${frozen[@]}"
+        printf 'started %s\n' "$(date +%s)"
+    } > "$STATE_FILE"
+
+    log "OFF frozen=${frozen[*]}"
+
+    echo -e "${RED}${BOLD}[✓] iCloud 同步已关闭${NC}"
+    echo -e "    已停止: ${CYAN}${frozen[*]}${NC}"
+    [ "${#failed[@]}" -gt 0 ] && echo -e "    ${YELLOW}跳过: ${failed[*]}${NC}"
+
+    # 自动恢复是一道可选保险丝，默认不启用
+    if [ "$AUTO_RESUME_SECS" -gt 0 ] 2>/dev/null; then
+        local mins=$((AUTO_RESUME_SECS / 60))
+        ( sleep "$AUTO_RESUME_SECS"
+          if [ -f "$STATE_FILE" ]; then
+              "$0" on >/dev/null 2>&1
+              log "AUTO-RESUME after ${AUTO_RESUME_SECS}s"
+          fi ) >/dev/null 2>&1 &
+        disown 2>/dev/null
+        echo -e "    ${YELLOW}自动恢复: ${mins} 分钟后（你开启了保险丝）${NC}"
+    else
+        echo -e "    ${BOLD}保持关闭: 一直关闭，直到你手动执行 on${NC}"
+    fi
+    echo -e "    恢复:   ${CYAN}icloudctl on${NC}"
+}
+
+# icloudctl on —— 打开 iCloud 同步（恢复守护进程）
+cmd_on() {
+    local resumed=() t
+
+    # 优先按状态文件恢复
+    if [ -f "$STATE_FILE" ]; then
+        while IFS= read -r t; do
+            case "$t" in
+                ""|started\ *) continue ;;
+            esac
+            if killall -CONT "$t" 2>/dev/null; then
+                resumed+=("$t")
+            fi
+        done < "$STATE_FILE"
+        rm -f "$STATE_FILE"
+    fi
+
+    # 兜底：把所有可能被冻住的目标都恢复一遍（状态文件丢失也不怕）
+    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+        if [ "$(stopped_count "$t")" -gt 0 ]; then
+            killall -CONT "$t" 2>/dev/null && resumed+=("$t")
+        fi
+    done
+
+    log "ON resumed=${resumed[*]:-none}"
+
+    if [ "${#resumed[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}[i] iCloud 同步本来就是开启状态${NC}"
+    else
+        echo -e "${GREEN}${BOLD}[✓] iCloud 同步已开启${NC}"
+        echo -e "    已解冻: ${CYAN}${resumed[*]}${NC}"
+    fi
+}
+
+cmd_status() {
+    echo -e "${BOLD}=== iCloud 同步状态 ===${NC}"
+
+    local overall=0 t total_frozen=0
+    printf '%-18s %-12s %s\n' "进程" "状态" "实例"
+    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+        local pids total stopped
+        pids=$(pgrep -u "$(id -u)" -x "$t" 2>/dev/null)
+        [ -z "$pids" ] && continue
+
+        total=$(echo "$pids" | wc -l | tr -d ' ')
+        stopped=$(stopped_count "$t")
+        total_frozen=$((total_frozen + stopped))
+
+        if [ "$stopped" -gt 0 ] && [ "$stopped" -eq "$total" ]; then
+            printf '%-18s %b %s\n' "$t" "${RED}${BOLD}已停止${NC}" "${stopped}/${total}"
+        elif [ "$stopped" -gt 0 ]; then
+            printf '%-18s %b %s\n' "$t" "${YELLOW}部分停止${NC}" "${stopped}/${total}"
+        else
+            printf '%-18s %b %s\n' "$t" "${GREEN}运行中${NC}" "0/${total}"
+        fi
+        [ "$stopped" -gt 0 ] && overall=1
+    done
+
+    echo
+    if [ "$overall" -eq 1 ]; then
+        echo -e "总状态: ${RED}${BOLD}● iCloud 同步已关闭${NC}"
+
+        if [ -f "$STATE_FILE" ]; then
+            local started now elapsed
+            started=$(awk '/^started /{print $2}' "$STATE_FILE" 2>/dev/null)
+            if [ -n "$started" ]; then
+                now=$(date +%s)
+                elapsed=$((now - started))
+                printf '已关闭: %d 分 %d 秒\n' $((elapsed / 60)) $((elapsed % 60))
+                if [ "$AUTO_RESUME_SECS" -gt 0 ] 2>/dev/null; then
+                    local left=$((AUTO_RESUME_SECS - elapsed))
+                    if [ "$left" -gt 0 ]; then
+                        printf '自动恢复: 还有 %d 分 %d 秒\n' $((left / 60)) $((left % 60))
+                    fi
+                else
+                    printf '保持关闭: 会一直关着，直到手动 on\n'
+                fi
+            fi
+        fi
+        echo -e "开启命令: ${CYAN}icloudctl on${NC}"
+    else
+        echo -e "总状态: ${GREEN}${BOLD}● iCloud 同步正常运行${NC}"
+        echo -e "关闭命令: ${CYAN}icloudctl off${NC}"
+    fi
+}
+
+# 网络流量快照：多次采样对比计数器增量
+# 计数器冻结 = 真停了；持续增长 = 正在传输
+cmd_stat() {
+    echo -e "${BOLD}=== 采样 3 秒，对比计数器增量 ===${NC}"
+    command -v nettop >/dev/null 2>&1 || { echo "nettop 不可用"; return 1; }
+
+    local raw
+    raw=$(nettop -P -x -l 3 -J bytes_in,bytes_out 2>/dev/null \
+          | grep -E "^(bird|cloudd|nsurlsessiond|itunescloudd|fileproviderd)\.")
+
+    if [ -z "$raw" ]; then
+        echo -e "${GREEN}[✓] iCloud 相关进程完全无流量${NC}"
+        return 0
+    fi
+
+    local report moving
+    report=$(printf '%s\n' "$raw" | awk '
+        {
+            name = $1; sub(/\..*/, "", name)
+            if (!(name in first_out)) { first_out[name]=$3; first_in[name]=$2 }
+            last_out[name]=$3; last_in[name]=$2; seen[name]=1
+        }
+        END {
+            m = 0
+            for (k in seen) {
+                d_out = last_out[k] - first_out[k]
+                d_in  = last_in[k]  - first_in[k]
+                st = (d_out == 0 && d_in == 0) ? "静止" : "活动中"
+                if (d_out != 0 || d_in != 0) m = 1
+                printf "  %-18s %-8s out +%-12d in +%d\n", k, st, d_out, d_in
+            }
+            printf "MOVING=%d\n", m
+        }')
+
+    moving=$(printf '%s\n' "$report" | awk -F= '/^MOVING=/{print $2}')
+    printf '%s\n' "$report" | grep -v '^MOVING='
+    echo
+    if [ "$moving" -eq 1 ]; then
+        echo -e "${YELLOW}● 计数器在增长 → 同步引擎正在传输（iCloud 开启中）${NC}"
+        echo -e "  若要关闭同步: ${CYAN}icloudctl off${NC}"
+    else
+        echo -e "${GREEN}● 计数器完全静止 → 传输已停止${NC}"
+    fi
+}
+
+cmd_doctor() {
+    echo -e "${BOLD}=== 环境自检 ===${NC}"
+    echo -n "macOS 版本:      "; sw_vers -productVersion
+    echo -n "dummynet 可用:   "
+    local d; d=$(sysctl -n net.inet.ip.dummynet.searches 2>/dev/null)
+    echo "${d:-N/A} (pf 限速在 macOS 26 已失效，本项目不走此路)"
+    echo -n "可冻结进程数:    "
+    local n=0 t
+    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+        pgrep -u "$(id -u)" -x "$t" >/dev/null 2>&1 && n=$((n + 1))
+    done
+    echo "$n"
+    echo -n "状态目录:        "; echo "$STATE_DIR"
+    echo -n "日志:            "; echo "$LOG_FILE"
+    echo -n "自动恢复:        "
+    if [ "$AUTO_RESUME_SECS" -gt 0 ] 2>/dev/null; then
+        echo "$((AUTO_RESUME_SECS / 60)) 分钟（保险丝已开）"
+    else
+        echo "关闭（off 后一直保持，直到手动 on）"
+    fi
+}
+
+usage() {
+    echo -e "${BOLD}icloudctl — 开关 iCloud 同步${NC}"
+    echo ""
+    echo "用法: icloudctl <命令>"
+    echo ""
+    echo -e "  ${GREEN}on${NC}                      打开 iCloud 同步（恢复上传/下载）"
+    echo -e "  ${RED}off${NC}                     关闭 iCloud 同步（一直关着，直到手动 on）"
+    echo -e "  ${RED}off --with-fileprovider${NC}  关闭时同时停 fileproviderd（微信/照片也会受影响）"
+    echo -e "  ${BLUE}status${NC}                  查看当前状态"
+    echo -e "  ${CYAN}stat${NC}                    抓 3 秒流量，验证是否真的停了"
+    echo -e "  ${CYAN}doctor${NC}                  环境自检"
+    echo ""
+    echo "环境变量:"
+    echo "  ICLOUDCTL_AUTO_RESUME_SECS=1800   off 后自动恢复的保险丝（默认 0 = 不启用）"
+    echo ""
+    echo "示例:"
+    echo "  icloudctl off     # 关掉同步，一直关到我手动开"
+    echo "  icloudctl on      # 打开同步"
+}
+
+case "${1:-status}" in
+    on)      shift; cmd_on "$@" ;;
+    off)     shift; cmd_off "$@" ;;
+    status)  cmd_status ;;
+    stat)    cmd_stat ;;
+    doctor)  cmd_doctor ;;
+    -h|--help|help) usage ;;
+    *)       usage; exit 1 ;;
+esac
