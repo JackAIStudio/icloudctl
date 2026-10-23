@@ -246,14 +246,20 @@ cmd_off() {
 
     # 自动恢复是一道可选保险丝，默认不启用
     if [ "$AUTO_RESUME_SECS" -gt 0 ] 2>/dev/null; then
-        local mins=$((AUTO_RESUME_SECS / 60))
+        local secs=$AUTO_RESUME_SECS mins=$((AUTO_RESUME_SECS / 60))
+        local human
+        if [ "$mins" -ge 1 ]; then
+            human="${mins} 分钟"
+        else
+            human="${secs} 秒"
+        fi
         ( sleep "$AUTO_RESUME_SECS"
           if [ -f "$STATE_FILE" ]; then
               "$0" on >/dev/null 2>&1
               log "AUTO-RESUME after ${AUTO_RESUME_SECS}s"
           fi ) >/dev/null 2>&1 &
         disown 2>/dev/null
-        echo -e "    ${YELLOW}自动恢复: ${mins} 分钟后（你开启了保险丝）${NC}"
+        echo -e "    ${YELLOW}自动恢复: ${human}后（你开启了保险丝）${NC}"
     else
         echo -e "    ${BOLD}保持关闭: 一直关闭，直到你手动执行 on${NC}"
     fi
