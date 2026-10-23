@@ -521,7 +521,7 @@ usage() {
     echo -e "  ${GREEN}on${NC}                      打开 iCloud 同步（恢复上传 / 下载）"
     echo -e "  ${RED}off${NC}                     关闭 iCloud 同步（一直关着，直到手动 on）"
     echo -e "  ${BLUE}status${NC}                  查看当前状态"
-    echo -e "  ${CYAN}stat${NC}                    抓 3 秒流量，验证是否真的停了"
+    echo -e "  ${CYAN}stat${NC}                    抓 4 秒流量，验证是否真的停了"
     echo -e "  ${CYAN}probe${NC} [次数]            实测界面是否被冻住（打开 / 保存对话框卡不卡）"
     echo -e "  ${CYAN}doctor${NC}                  环境自检"
     echo ""
