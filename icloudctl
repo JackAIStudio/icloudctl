@@ -2,28 +2,34 @@
 # icloudctl — 开关 macOS 的 iCloud 同步
 #
 # 语义：on  = 打开 iCloud 同步（恢复正常上传 / 下载）
-#       off = 关闭 iCloud 同步（冻结守护进程，一直关着直到手动 on）
+#       off = 关闭 iCloud 同步（冻结传输进程，一直关着直到手动 on）
 #
-# 原理：SIGSTOP 冻结负责同步的守护进程，SIGCONT 解冻。
+# 原理：SIGSTOP 冻结负责「搬数据」的守护进程，SIGCONT 解冻。
 #      不依赖网络层（Clash / pf），Clash 退出也照样有效。
 #
-# 关键事实（macOS 26 实测）：
+# 关键事实（macOS 26 / 27 实测，详见 README）：
+#   - 真正搬字节的是 nsurlsessiond；bird 只是同步引擎（元数据与调度），自己不联网
+#   - 冻 bird 会让任何同步调用 ubiquityIdentityToken 的 App 卡死
+#     （打开 / 保存对话框、Chromium / Electron 系都会中招）—— 所以默认不冻它
+#   - 冻 nsurlsessiond 能停住传输，且界面响应不受影响
 #   - pf + dummynet 限速在内核层已失效（searches 恒为 0），不要走那条路
-#   - 冻结的是内核级状态，与是否联网、代理是否运行无关
-#   - 上传和下载会同时停止，因为引擎本身被冻住了
+#   - 上传和下载会同时停止，因为传输引擎是同一个
 
 set -o pipefail
 
 # ---------------------------------------------------------------- 配置
 
-# 默认冻结目标：只包含「用户级」iCloud 同步进程
-# 刻意排除 fileproviderd（微信 / Photos 也在用，冻结会影响传文件）
-DEFAULT_TARGETS="bird cloudd nsurlsessiond itunescloudd"
+# 默认冻结目标：只冻「传输层」，刻意不含 bird
+DEFAULT_TARGETS="cloudd nsurlsessiond itunescloudd"
 
-# 需要 fileproviderd 时用：icloudctl on --with-fileprovider
+# 极限停同步时才会加上的进程；冻它会让打开 / 保存对话框卡住
+DEEP_TARGET="bird"
+
+# 微信 / 照片也在用 FileProvider，只有显式要求时才冻
 EXTRA_TARGETS="fileproviderd"
 
-# root 拥有的系统级 cloudd --system 无法也不需要冻结（权限不足，且与个人同步无关）
+# 已知的 iCloud 相关守护进程全集：用于扫描残留冻结、展示状态
+KNOWN_DAEMONS="bird cloudd nsurlsessiond itunescloudd fileproviderd"
 
 STATE_DIR="${ICLOUDCTL_STATE_DIR:-$HOME/.local/state/icloudctl}"
 STATE_FILE="$STATE_DIR/frozen.state"
@@ -34,6 +40,9 @@ LOG_FILE="$STATE_DIR/icloudctl.log"
 # 需要保险丝时显式开启：ICLOUDCTL_AUTO_RESUME_SECS=1800 icloudctl off
 AUTO_RESUME_SECS="${ICLOUDCTL_AUTO_RESUME_SECS:-0}"
 
+# probe 子命令的单次超时（秒）：超过这个时间就判定为「卡死」
+PROBE_TIMEOUT="${ICLOUDCTL_PROBE_TIMEOUT:-3}"
+
 # ---------------------------------------------------------------- 输出
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
@@ -43,7 +52,7 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null; }
 
-# ---------------------------------------------------------------- 核心
+# ---------------------------------------------------------------- 进程工具
 
 # 列出当前实际在跑的、我们有权冻结的目标进程
 running_targets() {
@@ -67,12 +76,118 @@ stopped_count() {
     echo "$n"
 }
 
-# icloudctl off —— 关闭 iCloud 同步（冻结守护进程）
+# 找出处于 T 状态、但不在 $1 列表里的已知守护进程。
+# 这些是上次异常退出留下的残留冻结，需要主动恢复，否则会一直卡着。
+stray_frozen() {
+    local keep="$1" t out=""
+    for t in $KNOWN_DAEMONS; do
+        case " $keep " in *" $t "*) continue ;; esac
+        if [ "$(stopped_count "$t")" -gt 0 ]; then
+            out="$out $t"
+        fi
+    done
+    echo "${out# }"
+}
+
+# ---------------------------------------------------------------- probe
+
+# 实测一次 ubiquityIdentityToken 的同步 XPC 往返耗时。
+# 这就是「打开 / 保存对话框」内部走的那个调用：bird 被冻住时它会永久阻塞。
+# 用系统自带的 osascript(JXA) 调 Foundation，不需要编译任何东西。
+# 输出：成功打印秒数（如 0.004），超时打印 HANG。
+probe_once() {
+    local to="${1:-3}" tmp p w rc
+    tmp=$(mktemp 2>/dev/null) || tmp="/tmp/icloudctl-probe.$$"
+
+    ( exec osascript -l JavaScript -e '
+ObjC.import("Foundation");
+var t0 = Date.now();
+var tok = $.NSFileManager.defaultManager.ubiquityIdentityToken;
+"" + ((Date.now() - t0) / 1000).toFixed(3);
+' >"$tmp" 2>/dev/null ) &
+    p=$!
+
+    ( sleep "$to"; kill -9 "$p" 2>/dev/null ) >/dev/null 2>&1 &
+    w=$!
+
+    wait "$p" 2>/dev/null
+    rc=$?
+    kill "$w" 2>/dev/null
+    wait "$w" 2>/dev/null
+
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"
+        echo "HANG"
+        return
+    fi
+    cat "$tmp" 2>/dev/null
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------- 信号
+
+# 对某个进程名的「当前用户」全部实例发信号，并**校验真的生效**。
+# 不能用 killall：系统里有同名的 _nsurlsessiond 实例（183 等），
+# killall 按名字匹配会撞上无权操作的那个却照样返回 0，导致假成功。
+# 只做判定，不往 stdout 输出（调用方用 $? 判断）。
+signal_user_procs() {
+    local name="$1" sig="$2" want="$3" pid ok=0 n
+    for pid in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+        kill -"$sig" "$pid" 2>/dev/null || continue
+        # 等状态落定再判定（SIGSTOP 本身同步，但 ps 有微小延迟）
+        for n in 1 2 3 4 5 6 7 8 9 10; do
+            case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
+                "$want"*) ok=1; break ;;
+                "") break ;;   # 进程没了
+            esac
+            sleep 0.02
+        done
+    done
+    [ "$ok" -eq 1 ]
+}
+
+# 判断某个进程名的当前用户实例是否处于给定状态
+procs_in_state() {
+    local name="$1" want="$2" pid
+    for pid in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+        case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
+            "$want"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 解冻：给当前用户的全部实例发 SIGCONT，并确认它们**不再**处于 T 状态。
+# （不能复用 signal_user_procs 的 want 判定：解冻后状态是 S，不是 T。）
+resume_procs() {
+    local name="$1" pid ok=0 n
+    for pid in $(pgrep -u "$(id -u)" -x "$name" 2>/dev/null); do
+        kill -CONT "$pid" 2>/dev/null || continue
+        for n in 1 2 3 4 5 6 7 8 9 10; do
+            case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
+                "") break ;;        # 进程没了
+                T*) sleep 0.02 ;;    # 还在停，继续等
+                *)  ok=1; break ;;  # 已经跑起来了
+            esac
+        done
+    done
+    [ "$ok" -eq 1 ]
+}
+
+# ---------------------------------------------------------------- off
+
+# icloudctl off —— 关闭 iCloud 同步（冻结传输进程）
 cmd_off() {
-    local with_fp=0
-    [ "$1" = "--with-fileprovider" ] && with_fp=1
+    local deep=0 with_fp=0 a
+    for a in "$@"; do
+        case "$a" in
+            --deep)              deep=1 ;;
+            --with-fileprovider) with_fp=1 ;;
+        esac
+    done
 
     local targets="$DEFAULT_TARGETS"
+    [ "$deep" -eq 1 ]    && targets="$targets $DEEP_TARGET"
     [ "$with_fp" -eq 1 ] && targets="$targets $EXTRA_TARGETS"
 
     if [ -f "$STATE_FILE" ]; then
@@ -81,11 +196,22 @@ cmd_off() {
         return 0
     fi
 
+    # 先清掉上次异常退出留下的残留冻结（不在本次目标集里的 T 进程）
+    local stray
+    stray=$(stray_frozen "$targets")
+    if [ -n "$stray" ]; then
+        local s
+        for s in $stray; do resume_procs "$s" >/dev/null; done
+        echo -e "${YELLOW}[!] 发现上次残留的冻结，已先恢复: ${CYAN}${stray}${NC}"
+        log "STRAY-RESUME ${stray}"
+    fi
+
     local frozen=() failed=()
     local t
     for t in $targets; do
         if pgrep -u "$(id -u)" -x "$t" >/dev/null 2>&1; then
-            if killall -STOP "$t" 2>/dev/null; then
+            # 按 pid 精确冻结，并校验状态真的变成 T
+            if signal_user_procs "$t" STOP T >/dev/null; then
                 frozen+=("$t")
             else
                 failed+=("$t")
@@ -104,11 +230,19 @@ cmd_off() {
         printf 'started %s\n' "$(date +%s)"
     } > "$STATE_FILE"
 
-    log "OFF frozen=${frozen[*]}"
+    log "OFF frozen=${frozen[*]} deep=${deep}"
 
     echo -e "${RED}${BOLD}[✓] iCloud 同步已关闭${NC}"
     echo -e "    已停止: ${CYAN}${frozen[*]}${NC}"
     [ "${#failed[@]}" -gt 0 ] && echo -e "    ${YELLOW}跳过: ${failed[*]}${NC}"
+
+    if [ "$deep" -eq 1 ]; then
+        echo -e "    ${YELLOW}${BOLD}注意: --deep 连 bird 一起冻了${NC}"
+        echo -e "    ${YELLOW}    打开 / 保存对话框、Chromium / Electron 系 App 会卡住${NC}"
+        echo -e "    ${YELLOW}    卡住时执行 ${CYAN}icloudctl on${NC}${YELLOW} 立即恢复${NC}"
+    else
+        echo -e "    ${GREEN}bird 保持运行${NC} —— 界面不会卡，传输已由 ${CYAN}nsurlsessiond${NC} 停住"
+    fi
 
     # 自动恢复是一道可选保险丝，默认不启用
     if [ "$AUTO_RESUME_SECS" -gt 0 ] 2>/dev/null; then
@@ -126,6 +260,8 @@ cmd_off() {
     echo -e "    恢复:   ${CYAN}icloudctl on${NC}"
 }
 
+# ---------------------------------------------------------------- on
+
 # icloudctl on —— 打开 iCloud 同步（恢复守护进程）
 cmd_on() {
     local resumed=() t
@@ -136,17 +272,18 @@ cmd_on() {
             case "$t" in
                 ""|started\ *) continue ;;
             esac
-            if killall -CONT "$t" 2>/dev/null; then
-                resumed+=("$t")
+            if procs_in_state "$t" T; then
+                resume_procs "$t" && resumed+=("$t")
             fi
         done < "$STATE_FILE"
         rm -f "$STATE_FILE"
     fi
 
-    # 兜底：把所有可能被冻住的目标都恢复一遍（状态文件丢失也不怕）
-    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+    # 兜底：把所有已知目标都恢复一遍（状态文件丢失、--deep 残留都不怕）。
+    # SIGCONT 对本来就在跑的进程是无操作，所以这里可以放心全量扫。
+    for t in $KNOWN_DAEMONS; do
         if [ "$(stopped_count "$t")" -gt 0 ]; then
-            killall -CONT "$t" 2>/dev/null && resumed+=("$t")
+            resume_procs "$t" && resumed+=("$t")
         fi
     done
 
@@ -160,19 +297,20 @@ cmd_on() {
     fi
 }
 
+# ---------------------------------------------------------------- status
+
 cmd_status() {
     echo -e "${BOLD}=== iCloud 同步状态 ===${NC}"
 
-    local overall=0 t total_frozen=0
+    local overall=0 t
     printf '%-18s %-12s %s\n' "进程" "状态" "实例"
-    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+    for t in $KNOWN_DAEMONS; do
         local pids total stopped
         pids=$(pgrep -u "$(id -u)" -x "$t" 2>/dev/null)
         [ -z "$pids" ] && continue
 
         total=$(echo "$pids" | wc -l | tr -d ' ')
         stopped=$(stopped_count "$t")
-        total_frozen=$((total_frozen + stopped))
 
         if [ "$stopped" -gt 0 ] && [ "$stopped" -eq "$total" ]; then
             printf '%-18s %b %s\n' "$t" "${RED}${BOLD}已停止${NC}" "${stopped}/${total}"
@@ -187,6 +325,13 @@ cmd_status() {
     echo
     if [ "$overall" -eq 1 ]; then
         echo -e "总状态: ${RED}${BOLD}● iCloud 同步已关闭${NC}"
+
+        if [ "$(stopped_count "$DEEP_TARGET")" -gt 0 ]; then
+            echo -e "${YELLOW}  ⚠ bird 也被冻住了（--deep）${NC}"
+            echo -e "${YELLOW}    界面可能卡住，${CYAN}icloudctl on${NC}${YELLOW} 可立即恢复${NC}"
+        else
+            echo -e "  bird 保持运行 —— 界面正常"
+        fi
 
         if [ -f "$STATE_FILE" ]; then
             local started now elapsed
@@ -212,14 +357,18 @@ cmd_status() {
     fi
 }
 
+# ---------------------------------------------------------------- stat
+
 # 网络流量快照：多次采样对比计数器增量
 # 计数器冻结 = 真停了；持续增长 = 正在传输
+# 采样 4 次，**故意丢掉第一次**：刚 off 完时内核 socket 缓冲里还有余量在计数，
+# 拿它当基准会误报「仍在传输」。从第二次起比较才反映真实状态。
 cmd_stat() {
-    echo -e "${BOLD}=== 采样 3 秒，对比计数器增量 ===${NC}"
+    echo -e "${BOLD}=== 采样 4 秒，对比计数器增量 ===${NC}"
     command -v nettop >/dev/null 2>&1 || { echo "nettop 不可用"; return 1; }
 
     local raw
-    raw=$(nettop -P -x -l 3 -J bytes_in,bytes_out 2>/dev/null \
+    raw=$(nettop -P -x -l 4 -J bytes_in,bytes_out 2>/dev/null \
           | grep -E "^(bird|cloudd|nsurlsessiond|itunescloudd|fileproviderd)\.")
 
     if [ -z "$raw" ]; then
@@ -231,6 +380,9 @@ cmd_stat() {
     report=$(printf '%s\n' "$raw" | awk '
         {
             name = $1; sub(/\..*/, "", name)
+            nseen[name]++
+            # 每个进程的第 1 个样本只用来预热，不参与差值计算
+            if (nseen[name] == 1) { next }
             if (!(name in first_out)) { first_out[name]=$3; first_in[name]=$2 }
             last_out[name]=$3; last_in[name]=$2; seen[name]=1
         }
@@ -250,12 +402,74 @@ cmd_stat() {
     printf '%s\n' "$report" | grep -v '^MOVING='
     echo
     if [ "$moving" -eq 1 ]; then
-        echo -e "${YELLOW}● 计数器在增长 → 同步引擎正在传输（iCloud 开启中）${NC}"
-        echo -e "  若要关闭同步: ${CYAN}icloudctl off${NC}"
+        # 判断是「真在同步」还是「刚 off 完，socket 缓冲里的余量还在走」
+        local any_frozen=0
+        for t in $DEFAULT_TARGETS $DEEP_TARGET; do
+            [ "$(stopped_count "$t")" -gt 0 ] && any_frozen=1
+        done
+        if [ "$any_frozen" -eq 1 ] && [ ! -f "$STATE_FILE" ]; then
+            echo -e "${YELLOW}● 计数器在增长，但传输进程处于冻结状态${NC}"
+            echo -e "  多半是刚解冻后 socket 缓冲里的余量 —— 等几秒再测一次"
+        elif [ "$any_frozen" -eq 1 ]; then
+            echo -e "${YELLOW}● 计数器在增长，但传输进程已冻结${NC}"
+            echo -e "  可能是 ${CYAN}bird${NC} 之外的其他进程在传，或缓冲余量；等几秒再测"
+        else
+            echo -e "${YELLOW}● 计数器在增长 → 同步引擎正在传输（iCloud 开启中）${NC}"
+            echo -e "  若要关闭同步: ${CYAN}icloudctl off${NC}"
+        fi
     else
         echo -e "${GREEN}● 计数器完全静止 → 传输已停止${NC}"
     fi
 }
+
+# ---------------------------------------------------------------- probe 命令
+
+# icloudctl probe —— 实测界面是否被冻住
+cmd_probe() {
+    local n="$1" i v worst=0 hangs=0
+    case "$n" in ''|*[!0-9]*) n=3 ;; esac
+
+    if ! command -v osascript >/dev/null 2>&1; then
+        echo -e "${RED}[✗] 找不到 osascript，无法探测${NC}"
+        return 1
+    fi
+
+    echo -e "${BOLD}=== iCloud 界面响应探测（${n} 次）===${NC}"
+    echo -e "    测的是 ubiquityIdentityToken：打开 / 保存对话框内部走的同步调用"
+    echo
+
+    for i in $(seq 1 "$n"); do
+        v=$(probe_once "$PROBE_TIMEOUT")
+        if [ "$v" = "HANG" ]; then
+            hangs=$((hangs + 1))
+            printf '  第 %d 次: %b\n' "$i" "${RED}${BOLD}卡死（>${PROBE_TIMEOUT}s）${NC}"
+        else
+            printf '  第 %d 次: %ss\n' "$i" "$v"
+            awk -v a="$v" -v b="$worst" 'BEGIN{exit !(a>b)}' && worst="$v"
+        fi
+    done
+
+    echo
+    if [ "$hangs" -gt 0 ]; then
+        echo -e "${RED}${BOLD}● 界面已被冻住${NC} —— 打开 / 保存对话框会卡"
+        if [ "$(stopped_count "$DEEP_TARGET")" -gt 0 ]; then
+            echo -e "  原因: ${CYAN}bird${NC} 处于冻结状态（用了 --deep）"
+        else
+            echo -e "  原因: 有守护进程被冻住，${CYAN}icloudctl status${NC} 查看"
+        fi
+        echo -e "  恢复: ${CYAN}icloudctl on${NC}"
+        return 1
+    fi
+
+    if awk -v w="$worst" 'BEGIN{exit !(w > 0.5)}'; then
+        echo -e "${YELLOW}● 响应偏慢（最慢 ${worst}s）${NC} —— 还不算卡死，但可能感觉顿"
+        echo -e "  想彻底顺畅: ${CYAN}icloudctl on${NC}"
+    else
+        echo -e "${GREEN}${BOLD}● 界面响应正常${NC}（最慢 ${worst}s）—— 打开 / 保存对话框不会卡"
+    fi
+}
+
+# ---------------------------------------------------------------- doctor
 
 cmd_doctor() {
     echo -e "${BOLD}=== 环境自检 ===${NC}"
@@ -265,10 +479,25 @@ cmd_doctor() {
     echo "${d:-N/A} (pf 限速在 macOS 26 已失效，本项目不走此路)"
     echo -n "可冻结进程数:    "
     local n=0 t
-    for t in $DEFAULT_TARGETS $EXTRA_TARGETS; do
+    for t in $KNOWN_DAEMONS; do
         pgrep -u "$(id -u)" -x "$t" >/dev/null 2>&1 && n=$((n + 1))
     done
     echo "$n"
+    echo -n "probe 可用:      "
+    if command -v osascript >/dev/null 2>&1; then
+        echo "是（JXA / Foundation）"
+    else
+        echo "否（缺 osascript）"
+    fi
+
+    echo -n "残留冻结:        "
+    local stray; stray=$(stray_frozen "$DEFAULT_TARGETS")
+    if [ -n "$stray" ]; then
+        echo -e "${YELLOW}$stray${NC}（建议 icloudctl on 恢复）"
+    else
+        echo "无"
+    fi
+
     echo -n "状态目录:        "; echo "$STATE_DIR"
     echo -n "日志:            "; echo "$LOG_FILE"
     echo -n "自动恢复:        "
@@ -277,25 +506,35 @@ cmd_doctor() {
     else
         echo "关闭（off 后一直保持，直到手动 on）"
     fi
+    echo
+    echo -e "${BOLD}默认冻结集:${NC} $DEFAULT_TARGETS"
+    echo -e "  （不含 ${CYAN}bird${NC} —— 冻它会让打开 / 保存对话框卡住）"
 }
+
+# ---------------------------------------------------------------- usage
 
 usage() {
     echo -e "${BOLD}icloudctl — 开关 iCloud 同步${NC}"
     echo ""
     echo "用法: icloudctl <命令>"
     echo ""
-    echo -e "  ${GREEN}on${NC}                      打开 iCloud 同步（恢复上传/下载）"
+    echo -e "  ${GREEN}on${NC}                      打开 iCloud 同步（恢复上传 / 下载）"
     echo -e "  ${RED}off${NC}                     关闭 iCloud 同步（一直关着，直到手动 on）"
-    echo -e "  ${RED}off --with-fileprovider${NC}  关闭时同时停 fileproviderd（微信/照片也会受影响）"
     echo -e "  ${BLUE}status${NC}                  查看当前状态"
     echo -e "  ${CYAN}stat${NC}                    抓 3 秒流量，验证是否真的停了"
+    echo -e "  ${CYAN}probe${NC} [次数]            实测界面是否被冻住（打开 / 保存对话框卡不卡）"
     echo -e "  ${CYAN}doctor${NC}                  环境自检"
+    echo ""
+    echo -e "  ${YELLOW}off --deep${NC}               连 bird 一起冻（极限停同步，界面会卡）"
+    echo -e "  ${YELLOW}off --with-fileprovider${NC}  连 fileproviderd 一起冻（微信 / 照片也受影响）"
     echo ""
     echo "环境变量:"
     echo "  ICLOUDCTL_AUTO_RESUME_SECS=1800   off 后自动恢复的保险丝（默认 0 = 不启用）"
+    echo "  ICLOUDCTL_PROBE_TIMEOUT=3         probe 的单次超时秒数"
     echo ""
     echo "示例:"
-    echo "  icloudctl off     # 关掉同步，一直关到我手动开"
+    echo "  icloudctl off     # 关掉同步，传输停、界面不卡"
+    echo "  icloudctl probe   # 验证界面确实没被卡住"
     echo "  icloudctl on      # 打开同步"
 }
 
@@ -304,6 +543,7 @@ case "${1:-status}" in
     off)     shift; cmd_off "$@" ;;
     status)  cmd_status ;;
     stat)    cmd_stat ;;
+    probe)   shift; cmd_probe "$@" ;;
     doctor)  cmd_doctor ;;
     -h|--help|help) usage ;;
     *)       usage; exit 1 ;;
